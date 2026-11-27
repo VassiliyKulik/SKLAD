@@ -2,14 +2,15 @@ import asyncio
 import csv
 import io
 import logging
-import re
-import sqlite3
 import os
+import re
+import secrets
+import sqlite3
 from datetime import datetime
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -86,6 +87,20 @@ def init_db():
             PRIMARY KEY (workspace_id, tg_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
             FOREIGN KEY (tg_id) REFERENCES users(tg_id)
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workspace_invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            workspace_id INTEGER NOT NULL,
+            created_by_tg_id INTEGER NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
         )
         """
     )
@@ -229,7 +244,91 @@ async def db_upsert_user(tg_id: int, username: Optional[str], full_name: str):
             logging.warning(f"Не удалось уведомить пользователя {tg_id} о подключении к складу {ws_id}: {e}")
 
 
-def db_get_user_workspaces(tg_id: int) -> list[dict]:
+def db_get_or_create_invite(workspace_id: int, creator_tg_id: int, rotate: bool = False) -> str:
+    conn = get_conn()
+    cur = conn.cursor()
+    if rotate:
+        cur.execute(
+            "UPDATE workspace_invites SET is_active = 0 WHERE workspace_id = ? AND is_active = 1",
+            (workspace_id,),
+        )
+    else:
+        row = cur.execute(
+            """
+            SELECT code FROM workspace_invites
+            WHERE workspace_id = ? AND is_active = 1
+            ORDER BY id DESC LIMIT 1
+            """,
+            (workspace_id,),
+        ).fetchone()
+        if row:
+            conn.close()
+            return str(row["code"])
+
+    code = f"inv_{secrets.token_urlsafe(8)}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        INSERT INTO workspace_invites (code, workspace_id, created_by_tg_id, is_active, created_at)
+        VALUES (?, ?, ?, 1, ?)
+        """,
+        (code, workspace_id, creator_tg_id, now_str),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def db_accept_invite_code(code: str, tg_id: int) -> tuple[str, Optional[dict]]:
+    conn = get_conn()
+    cur = conn.cursor()
+    inv = cur.execute(
+        """
+        SELECT wi.id, wi.workspace_id, wi.created_by_tg_id, wi.is_active, w.title, w.owner_tg_id
+        FROM workspace_invites wi
+        JOIN workspaces w ON w.id = wi.workspace_id
+        WHERE wi.code = ?
+        """,
+        (code,),
+    ).fetchone()
+
+    if not inv:
+        conn.close()
+        return "not_found", None
+    if int(inv["is_active"]) != 1:
+        conn.close()
+        return "inactive", None
+
+    ws_id = int(inv["workspace_id"])
+    ws_title = str(inv["title"])
+    owner_tg_id = int(inv["owner_tg_id"])
+
+    existing = cur.execute(
+        "SELECT role FROM workspace_members WHERE workspace_id = ? AND tg_id = ?",
+        (ws_id, tg_id),
+    ).fetchone()
+
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO workspace_members (workspace_id, tg_id, role)
+        VALUES (?, ?, 'member')
+        """,
+        (ws_id, tg_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO users (tg_id, active_workspace_id)
+        VALUES (?, ?)
+        ON CONFLICT(tg_id) DO UPDATE SET active_workspace_id = excluded.active_workspace_id
+        """,
+        (tg_id, ws_id),
+    )
+    conn.commit()
+    conn.close()
+
+    status = "already_member" if existing else "joined"
+    return status, {"id": ws_id, "title": ws_title, "owner_tg_id": owner_tg_id}
+    def db_get_user_workspaces(tg_id: int) -> list[dict]:
     conn = get_conn()
     cur = conn.cursor()
     rows = cur.execute(
@@ -426,6 +525,7 @@ def db_delete_workspace(workspace_id: int, caller_tg_id: int, is_admin: bool) ->
     title = ws["title"]
     cur.execute("DELETE FROM movements WHERE workspace_id = ?", (workspace_id,))
     cur.execute("DELETE FROM catalog_items WHERE workspace_id = ?", (workspace_id,))
+    cur.execute("DELETE FROM workspace_invites WHERE workspace_id = ?", (workspace_id,))
     cur.execute("DELETE FROM pending_invites WHERE workspace_id = ?", (workspace_id,))
     cur.execute("DELETE FROM workspace_members WHERE workspace_id = ?", (workspace_id,))
     cur.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
@@ -538,59 +638,6 @@ def db_remove_pending_invite(workspace_id: int, invite_id: int) -> Optional[str]
     conn.commit()
     conn.close()
     return uname
-
-
-def db_invite_by_username(workspace_id: int, raw_username: str, inviter_tg_id: int) -> tuple[str, str, Optional[int]]:
-    uname_norm = norm_username(raw_username)
-    if not uname_norm:
-        return "invalid", "", None
-
-    conn = get_conn()
-    cur = conn.cursor()
-    ws = cur.execute("SELECT id, title FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
-    if not ws:
-        conn.close()
-        return "no_ws", uname_norm, None
-
-    user_row = cur.execute(
-        "SELECT tg_id FROM users WHERE lower(trim(username)) = ?",
-        (uname_norm,),
-    ).fetchone()
-
-    if user_row:
-        target_tg_id = int(user_row["tg_id"])
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO workspace_members (workspace_id, tg_id, role)
-            VALUES (?, ?, 'member')
-            """,
-            (workspace_id, target_tg_id),
-        )
-        cur.execute(
-            """
-            UPDATE users
-            SET active_workspace_id = COALESCE(active_workspace_id, ?)
-            WHERE tg_id = ?
-            """,
-            (workspace_id, target_tg_id),
-        )
-        conn.commit()
-        conn.close()
-        return "linked", uname_norm, target_tg_id
-
-    cur.execute(
-        """
-        INSERT INTO pending_invites (workspace_id, username_norm, invited_by_tg_id, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(workspace_id, username_norm) DO UPDATE SET
-            invited_by_tg_id = excluded.invited_by_tg_id,
-            created_at = excluded.created_at
-        """,
-        (workspace_id, uname_norm, inviter_tg_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-    )
-    conn.commit()
-    conn.close()
-    return "pending", uname_norm, None
 
 
 def db_list_workspaces() -> list[sqlite3.Row]:
@@ -812,6 +859,8 @@ def db_delete_movement_by_id(
     conn.commit()
     conn.close()
     return "ok", info
+
+
 async def notify_admins(text: str):
     for admin_id in ADMIN_IDS:
         try:
@@ -905,10 +954,6 @@ class EditWorkspaceStates(StatesGroup):
     entering_title = State()
 
 
-class LinkUserStates(StatesGroup):
-    entering_username = State()
-
-
 class FeedbackStates(StatesGroup):
     entering_message = State()
 
@@ -938,7 +983,7 @@ def get_menu_list_keyboard(has_workspace: bool, is_admin: bool) -> ReplyKeyboard
         rows.append([KeyboardButton(text="🔄 Сменить склад")])
         rows.append([KeyboardButton(text="📥 Остатки в Excel")])
         rows.append([KeyboardButton(text="👤 Участники склада")])
-        rows.append([KeyboardButton(text="👥 Привязать сотрудника")])
+        rows.append([KeyboardButton(text="👥 Пригласить сотрудника")])
         rows.append([KeyboardButton(text="❌ Отвязать сотрудника")])
         rows.append([KeyboardButton(text="ℹ️ Мой склад")])
         rows.append([KeyboardButton(text="🆕 Создать склад")])
@@ -960,9 +1005,7 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
     )
-
-
-async def ensure_workspace(message: types.Message) -> Optional[dict]:
+    async def ensure_workspace(message: types.Message) -> Optional[dict]:
     user = message.from_user
     await db_upsert_user(user.id, user.username, user.full_name or "")
     ws = db_get_active_workspace(user.id)
@@ -976,13 +1019,71 @@ async def ensure_workspace(message: types.Message) -> Optional[dict]:
     return ws
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
+async def build_invite_message(
+    workspace_id: int, ws_title: str, creator_tg_id: int, rotate: bool = False
+) -> tuple[str, InlineKeyboardMarkup]:
+    bot_info = await bot.get_me()
+    code = db_get_or_create_invite(workspace_id, creator_tg_id, rotate=rotate)
+    link = f"https://t.me/{bot_info.username}?start={code}"
+    text = (
+        f"🔗 **Ссылка для приглашения на склад «{ws_title}»**\n\n"
+        f"`{link}`\n\n"
+        f"Отправьте эту ссылку сотруднику в WhatsApp или Telegram. "
+        f"Когда он откроет ссылку и нажмёт **Запустить**, бот автоматически подключит его к складу."
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Перевыпустить ссылку", callback_data=f"rotinv:{workspace_id}")],
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="cancel")],
+        ]
+    )
+    return text, markup
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject):
     await state.clear()
     user = message.from_user
     await db_upsert_user(user.id, user.username, user.full_name or "")
-    ws = db_get_active_workspace(user.id)
 
+    args = (command.args or "").strip() if command else ""
+    if args.startswith("inv_"):
+        status, ws_info = db_accept_invite_code(args, user.id)
+        if status == "joined" and ws_info:
+            actor_label = user.full_name or (f"@{user.username}" if user.username else f"ID {user.id}")
+            uname_part = f" (@{user.username})" if user.username else ""
+            await message.answer(
+                f"✅ Вы подключены к складу **«{ws_info['title']}»**!",
+                reply_markup=get_main_keyboard(has_workspace=True),
+                parse_mode="Markdown",
+            )
+            if ws_info["owner_tg_id"] != user.id:
+                try:
+                    await bot.send_message(
+                        ws_info["owner_tg_id"],
+                        f"👤 По ссылке к складу **«{ws_info['title']}»** подключился сотрудник: **{actor_label}**{uname_part}.",
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logging.warning(f"Не удалось уведомить владельца {ws_info['owner_tg_id']}: {e}")
+            return
+
+        if status == "already_member" and ws_info:
+            await message.answer(
+                f"Вы уже состоите на складе **«{ws_info['title']}»** — он выбран активным.",
+                reply_markup=get_main_keyboard(has_workspace=True),
+                parse_mode="Markdown",
+            )
+            return
+
+        active_ws = db_get_active_workspace(user.id)
+        await message.answer(
+            "⚠️ Ссылка приглашения недействительна или устарела. Попросите владельца склада отправить новую ссылку.",
+            reply_markup=get_main_keyboard(has_workspace=bool(active_ws)),
+        )
+        return
+
+    ws = db_get_active_workspace(user.id)
     if ws:
         text = (
             f"Складской учёт готов к работе.\n"
@@ -1060,7 +1161,10 @@ async def start_feedback(message: types.Message, state: FSMContext):
 async def process_feedback_message(message: types.Message, state: FSMContext):
     text = (message.text or "").strip()
     if not text:
-        await message.answer("Сообщение не может быть пустым. Напишите текст или нажмите «❌ Отмена»:", reply_markup=get_cancel_keyboard())
+        await message.answer(
+            "Сообщение не может быть пустым. Напишите текст или нажмите «❌ Отмена»:",
+            reply_markup=get_cancel_keyboard(),
+        )
         return
 
     user = message.from_user
@@ -1095,7 +1199,6 @@ async def handle_reply_messages(message: types.Message):
     if not text:
         return
 
-    # 1. Администратор отвечает пользователю по ID из пересланного сообщения
     if user.id in ADMIN_IDS:
         match = re.search(r"ID:\s*`?(\d+)`?", replied.text)
         if not match:
@@ -1112,7 +1215,6 @@ async def handle_reply_messages(message: types.Message):
             await message.reply(f"❌ Не удалось отправить ответ: {e}")
         return
 
-    # 2. Пользователь отвечает боту на сообщение — пересылаем диалог администратору
     if replied.from_user and replied.from_user.id == bot.id:
         uname_str = f"@{user.username}" if user.username else "нет"
         name_str = user.full_name or "Пользователь"
@@ -1379,7 +1481,7 @@ async def my_workspace_info(message: types.Message):
     user = message.from_user
     lines = [
         f"📦 **Активный склад:** «{ws['title']}»",
-        "• Подключить сотрудника: нажмите **«📋 Меню»** → **«👥 Привязать сотрудника»** и укажите его `@никнейм`.",
+        "• Подключить сотрудника: нажмите **«📋 Меню»** → **«👥 Пригласить сотрудника»** и отправьте ему готовую ссылку.",
     ]
     if user.id in ADMIN_IDS:
         lines.append(f"• *(Админ)* ID владельца: `{ws['owner_tg_id']}`")
@@ -1413,7 +1515,7 @@ async def show_workspace_members(message: types.Message):
             lines.append(f"• **{name_txt}**{uname_txt} — {role_txt}{id_txt}")
 
     if pending:
-        lines.append("\n⏳ **Ожидают первого входа в бот:**")
+        lines.append("\n⏳ **Ожидают первого входа в бот (по @username):**")
         for p in pending:
             lines.append(f"• @{p['username_norm']}")
 
@@ -1424,69 +1526,40 @@ async def show_workspace_members(message: types.Message):
     )
 
 
-@dp.message(F.text == "👥 Привязать сотрудника")
-async def start_link_user_ui(message: types.Message, state: FSMContext):
+@dp.message(F.text == "👥 Пригласить сотрудника")
+async def send_workspace_invite_link(message: types.Message, state: FSMContext):
     ws = await ensure_workspace(message)
     if not ws:
         return
     user = message.from_user
     if user.id not in ADMIN_IDS and user.id != ws["owner_tg_id"]:
         await message.answer(
-            "Привязывать сотрудников может только владелец склада или администратор.",
+            "Создавать ссылки для приглашения может только владелец склада или администратор.",
             reply_markup=get_main_keyboard(has_workspace=True),
         )
         return
 
     await state.clear()
-    await state.update_data(target_ws_id=ws["id"], target_ws_title=ws["title"])
-    await state.set_state(LinkUserStates.entering_username)
-
-    await message.answer(
-        f"Привязка сотрудника к складу **«{ws['title']}»**.\n"
-        f"Введите **никнейм** сотрудника в формате `@username`:",
-        reply_markup=get_cancel_keyboard(),
-        parse_mode="Markdown",
-    )
+    text, markup = await build_invite_message(ws["id"], ws["title"], user.id, rotate=False)
+    await message.answer(text, reply_markup=markup, parse_mode="Markdown")
 
 
-@dp.message(LinkUserStates.entering_username)
-async def process_link_username(message: types.Message, state: FSMContext):
-    raw = (message.text or "").strip()
-    uname_norm = norm_username(raw)
-    if not uname_norm or len(uname_norm) < 2:
-        await message.answer("Укажите корректный никнейм, например `@ivanov`:", reply_markup=get_cancel_keyboard())
+@dp.callback_query(F.data.startswith("rotinv:"))
+async def rotate_workspace_invite_link(callback: types.CallbackQuery):
+    ws_id = int(callback.data.split(":", 1)[1])
+    user = callback.from_user
+    ws = db_get_workspace_info(ws_id)
+    if not ws:
+        await callback.message.edit_text("Склад не найден.")
+        await callback.answer()
+        return
+    if user.id not in ADMIN_IDS and user.id != ws["owner_tg_id"]:
+        await callback.answer("Недостаточно прав", show_alert=True)
         return
 
-    data = await state.get_data()
-    ws_id = int(data["target_ws_id"])
-    ws_title = data["target_ws_title"]
-    user = message.from_user
-
-    status, _, target_tg_id = db_invite_by_username(ws_id, uname_norm, user.id)
-    await state.clear()
-
-    if status == "linked":
-        await message.answer(
-            f"✅ Пользователь **@{uname_norm}** подключён к складу **«{ws_title}»**.",
-            reply_markup=get_main_keyboard(has_workspace=True),
-            parse_mode="Markdown",
-        )
-        if target_tg_id:
-            try:
-                await bot.send_message(
-                    target_tg_id,
-                    f"✅ Вас подключили к складу **«{ws_title}»**.",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logging.warning(f"Не удалось отправить уведомление пользователю {target_tg_id}: {e}")
-    else:
-        await message.answer(
-            f"⏳ Приглашение для **@{uname_norm}** сохранено.\n"
-            f"Он автоматически подключится к складу **«{ws_title}»**, когда нажмёт `/start` в боте.",
-            reply_markup=get_main_keyboard(has_workspace=True),
-            parse_mode="Markdown",
-        )
+    text, markup = await build_invite_message(ws["id"], ws["title"], user.id, rotate=True)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    await callback.answer("Ссылка обновлена")
 
 
 @dp.message(F.text == "❌ Отвязать сотрудника")
@@ -1663,6 +1736,8 @@ async def admin_switch_workspace(callback: types.CallbackQuery):
     else:
         await callback.message.edit_text("Склад не найден.")
     await callback.answer()
+
+
 # --- ДОБАВЛЕНИЕ И РЕДАКТИРОВАНИЕ ПОЗИЦИЙ ---
 @dp.message(F.text == "📝 Добавить позицию")
 async def start_add_catalog_item(message: types.Message, state: FSMContext):
@@ -1803,9 +1878,7 @@ async def process_category_callback(callback: types.CallbackQuery, state: FSMCon
 @dp.message(AddCatalogStates.entering_category)
 async def process_category_text(message: types.Message, state: FSMContext):
     await save_catalog_item(message, state, message.text or "")
-
-
-@dp.message(F.text == "✏️ Редактировать позицию")
+    @dp.message(F.text == "✏️ Редактировать позицию")
 async def start_edit_catalog_item(message: types.Message, state: FSMContext):
     ws = await ensure_workspace(message)
     if not ws:
