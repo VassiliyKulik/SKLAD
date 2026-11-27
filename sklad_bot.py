@@ -328,7 +328,7 @@ def db_accept_invite_code(code: str, tg_id: int) -> tuple[str, Optional[dict]]:
 
     status = "already_member" if existing else "joined"
     return status, {"id": ws_id, "title": ws_title, "owner_tg_id": owner_tg_id}
-def db_get_user_workspaces(tg_id: int) -> list[dict]:
+    def db_get_user_workspaces(tg_id: int) -> list[dict]:
     conn = get_conn()
     cur = conn.cursor()
     rows = cur.execute(
@@ -1005,7 +1005,7 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text="❌ Отмена")]],
         resize_keyboard=True,
     )
-async def ensure_workspace(message: types.Message) -> Optional[dict]:
+    async def ensure_workspace(message: types.Message) -> Optional[dict]:
     user = message.from_user
     await db_upsert_user(user.id, user.username, user.full_name or "")
     ws = db_get_active_workspace(user.id)
@@ -1878,7 +1878,7 @@ async def process_category_callback(callback: types.CallbackQuery, state: FSMCon
 @dp.message(AddCatalogStates.entering_category)
 async def process_category_text(message: types.Message, state: FSMContext):
     await save_catalog_item(message, state, message.text or "")
-@dp.message(F.text == "✏️ Редактировать позицию")
+    @dp.message(F.text == "✏️ Редактировать позицию")
 async def start_edit_catalog_item(message: types.Message, state: FSMContext):
     ws = await ensure_workspace(message)
     if not ws:
