@@ -5,7 +5,6 @@ import logging
 import sqlite3
 from datetime import datetime
 from typing import Optional
-
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -18,14 +17,12 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
-
 try:
     import openpyxl
 
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
-
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = "8763607619:AAGcLqQjNSkjCPYmFcjE_HhC458D_HrUyig"
 DB_FILE = "sklad_data.db"
@@ -35,19 +32,14 @@ LOW_STOCK_THRESHOLD = 0.0
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
-
-
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS workspaces (
@@ -58,7 +50,6 @@ def init_db():
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -70,7 +61,6 @@ def init_db():
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS workspace_members (
@@ -83,7 +73,6 @@ def init_db():
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS pending_invites (
@@ -97,7 +86,6 @@ def init_db():
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS catalog_items (
@@ -111,7 +99,6 @@ def init_db():
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS movements (
@@ -131,12 +118,10 @@ def init_db():
         )
         """
     )
-
     user_cols = [r["name"] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "workspace_id" in user_cols and "active_workspace_id" not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN active_workspace_id INTEGER")
         cur.execute("UPDATE users SET active_workspace_id = workspace_id WHERE workspace_id IS NOT NULL")
-
     cur.execute(
         """
         INSERT OR IGNORE INTO workspace_members (workspace_id, tg_id, role)
@@ -151,15 +136,10 @@ def init_db():
         WHERE active_workspace_id IS NOT NULL
         """
     )
-
     conn.commit()
     conn.close()
-
-
 def norm_username(raw: str) -> str:
     return raw.strip().lstrip("@").strip().lower()
-
-
 async def db_upsert_user(tg_id: int, username: Optional[str], full_name: str):
     uname_clean = (username or "").strip().lstrip("@")
     uname_norm = uname_clean.lower()
@@ -208,7 +188,6 @@ async def db_upsert_user(tg_id: int, username: Optional[str], full_name: str):
             )
             cur.execute("DELETE FROM pending_invites WHERE id = ?", (inv["id"],))
             applied_workspaces.append((ws_id, inv["title"]))
-
     conn.commit()
     conn.close()
 
