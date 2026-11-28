@@ -39,6 +39,7 @@ ADMIN_IDS: set[int] = {
     if x.strip().isdigit()
 }
 LOW_STOCK_THRESHOLD = 0.0
+BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-full-kb-refresh")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -1342,15 +1343,31 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+async def send_with_fresh_keyboard(
+    message: types.Message,
+    text: str,
+    has_workspace: bool,
+    is_admin: bool = False,
+    in_menu: bool = False,
+    parse_mode: Optional[str] = "Markdown",
+):
+    kb = (
+        get_menu_list_keyboard(has_workspace=has_workspace, is_admin=is_admin)
+        if in_menu
+        else get_main_keyboard(has_workspace=has_workspace)
+    )
+    await message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+
+
 async def ensure_workspace(message: types.Message) -> Optional[dict]:
     user = message.from_user
     await db_upsert_user(user.id, user.username, user.full_name or "")
     ws = db_get_active_workspace(user.id)
     if not ws:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "У вас пока нет подключённого склада.\nНажмите **«🆕 Создать склад»**, чтобы создать свой склад.",
-            reply_markup=get_main_keyboard(has_workspace=False),
-            parse_mode="Markdown",
+            has_workspace=False,
         )
         return None
     return ws
@@ -1389,10 +1406,10 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
         if status == "joined" and ws_info:
             actor_label = user.full_name or (f"@{user.username}" if user.username else f"ID {user.id}")
             uname_part = f" (@{user.username})" if user.username else ""
-            await message.answer(
+            await send_with_fresh_keyboard(
+                message,
                 f"✅ Вы подключены к складу **«{ws_info['title']}»**!",
-                reply_markup=get_main_keyboard(has_workspace=True),
-                parse_mode="Markdown",
+                has_workspace=True,
             )
             if ws_info["owner_tg_id"] != user.id:
                 try:
@@ -1406,17 +1423,19 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
             return
 
         if status == "already_member" and ws_info:
-            await message.answer(
+            await send_with_fresh_keyboard(
+                message,
                 f"Вы уже состоите на складе **«{ws_info['title']}»** — он выбран активным.",
-                reply_markup=get_main_keyboard(has_workspace=True),
-                parse_mode="Markdown",
+                has_workspace=True,
             )
             return
 
         active_ws = db_get_active_workspace(user.id)
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "⚠️ Ссылка приглашения недействительна или устарела. Попросите владельца склада отправить новую ссылку.",
-            reply_markup=get_main_keyboard(has_workspace=bool(active_ws)),
+            has_workspace=bool(active_ws),
+            parse_mode=None,
         )
         return
 
@@ -1433,10 +1452,10 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
             "Нажмите **«🆕 Создать склад»**, чтобы создать свой склад."
         )
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         text,
-        reply_markup=get_main_keyboard(has_workspace=bool(ws)),
-        parse_mode="Markdown",
+        has_workspace=bool(ws),
     )
 
 
@@ -1448,9 +1467,13 @@ async def open_menu_buttons(message: types.Message, state: FSMContext):
     ws = db_get_active_workspace(user.id)
     is_admin = user.id in ADMIN_IDS
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "Выберите действие:",
-        reply_markup=get_menu_list_keyboard(has_workspace=bool(ws), is_admin=is_admin),
+        has_workspace=bool(ws),
+        is_admin=is_admin,
+        in_menu=True,
+        parse_mode=None,
     )
 
 
@@ -1460,9 +1483,11 @@ async def back_to_main_keyboard(message: types.Message, state: FSMContext):
     user = message.from_user
     await db_upsert_user(user.id, user.username, user.full_name or "")
     ws = db_get_active_workspace(user.id)
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "Главное меню:",
-        reply_markup=get_main_keyboard(has_workspace=bool(ws)),
+        has_workspace=bool(ws),
+        parse_mode=None,
     )
 
 
@@ -1472,9 +1497,11 @@ async def cancel_operation_cb(callback: types.CallbackQuery, state: FSMContext):
     user = callback.from_user
     ws = db_get_active_workspace(user.id)
     await callback.message.edit_text("Действие отменено.")
-    await callback.message.answer(
+    await send_with_fresh_keyboard(
+        callback.message,
         "Главное меню:",
-        reply_markup=get_main_keyboard(has_workspace=bool(ws)),
+        has_workspace=bool(ws),
+        parse_mode=None,
     )
     await callback.answer()
 
@@ -1518,10 +1545,10 @@ async def process_feedback_message(message: types.Message, state: FSMContext):
     )
     await notify_admins(admin_text)
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "✅ **Спасибо!** Ваше сообщение отправлено администратору.",
-        reply_markup=get_main_keyboard(has_workspace=bool(ws)),
-        parse_mode="Markdown",
+        has_workspace=bool(ws),
     )
 
 
@@ -1581,7 +1608,7 @@ async def admin_backup_db(message: types.Message):
             data = f.read()
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
         doc = BufferedInputFile(data, filename=f"backup_sklad_{stamp}.db")
-        await message.answer_document(doc, caption="💾 Резервная копия базы данных")
+        await message.answer_document(doc, caption=f"💾 Резервная копия базы данных (сборка `{BOT_VERSION}`)", parse_mode="Markdown")
     except Exception as e:
         await message.answer(f"❌ Ошибка при создании бэкапа: {e}")
 
@@ -1612,10 +1639,10 @@ async def process_create_workspace_title(message: types.Message, state: FSMConte
     db_create_and_bind_workspace(user.id, title)
     await state.clear()
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         f"✅ Склад **«{title}»** создан и выбран активным!",
-        reply_markup=get_main_keyboard(has_workspace=True),
-        parse_mode="Markdown",
+        has_workspace=True,
     )
 
 
@@ -1627,9 +1654,11 @@ async def msg_edit_workspace(message: types.Message, state: FSMContext):
     user = message.from_user
     is_admin = user.id in ADMIN_IDS
     if not is_admin and user.id != ws["owner_tg_id"]:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "Редактировать название склада может только его владелец или администратор.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -1659,16 +1688,16 @@ async def process_edit_workspace_title(message: types.Message, state: FSMContext
     await state.clear()
 
     if status == "not_found":
-        await message.answer("Склад не найден.", reply_markup=get_main_keyboard(has_workspace=True))
+        await send_with_fresh_keyboard(message, "Склад не найден.", has_workspace=True, parse_mode=None)
         return
     if status == "forbidden":
-        await message.answer("Недостаточно прав для редактирования склада.", reply_markup=get_main_keyboard(has_workspace=True))
+        await send_with_fresh_keyboard(message, "Недостаточно прав для редактирования склада.", has_workspace=True, parse_mode=None)
         return
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         f"✅ Название склада изменено: **«{old_title}»** → **«{new_title}»**.",
-        reply_markup=get_main_keyboard(has_workspace=True),
-        parse_mode="Markdown",
+        has_workspace=True,
     )
 
 
@@ -1680,9 +1709,11 @@ async def request_delete_workspace(message: types.Message):
     user = message.from_user
     is_admin = user.id in ADMIN_IDS
     if not is_admin and user.id != ws["owner_tg_id"]:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "Удалить склад может только его владелец или администратор.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -1764,10 +1795,10 @@ async def switch_user_workspace_menu(message: types.Message):
     active_id = active["id"] if active else None
 
     if not workspaces:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "У вас пока нет доступных складов. Нажмите **«🆕 Создать склад»**.",
-            reply_markup=get_main_keyboard(has_workspace=False),
-            parse_mode="Markdown",
+            has_workspace=False,
         )
         return
 
@@ -1804,9 +1835,11 @@ async def process_switch_my_workspace(callback: types.CallbackQuery):
             f"✅ Активный склад изменён на **«{title}»**.",
             parse_mode="Markdown",
         )
-        await callback.message.answer(
+        await send_with_fresh_keyboard(
+            callback.message,
             "Главное меню:",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
     else:
         await callback.message.edit_text("Не удалось переключиться на этот склад.")
@@ -1830,11 +1863,12 @@ async def my_workspace_info(message: types.Message):
     ]
     if user.id in ADMIN_IDS:
         lines.append(f"• *(Админ)* ID владельца: `{ws['owner_tg_id']}`")
+        lines.append(f"• *(Админ)* Версия сборки: `{BOT_VERSION}`")
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "\n".join(lines),
-        reply_markup=get_main_keyboard(has_workspace=True),
-        parse_mode="Markdown",
+        has_workspace=True,
     )
 
 
@@ -1864,10 +1898,10 @@ async def show_workspace_members(message: types.Message):
         for p in pending:
             lines.append(f"• @{p['username_norm']}")
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "\n".join(lines),
-        reply_markup=get_main_keyboard(has_workspace=True),
-        parse_mode="Markdown",
+        has_workspace=True,
     )
 
 
@@ -1878,9 +1912,11 @@ async def send_workspace_invite_link(message: types.Message, state: FSMContext):
         return
     user = message.from_user
     if user.id not in ADMIN_IDS and user.id != ws["owner_tg_id"]:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "Создавать ссылки для приглашения может только владелец склада или администратор.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -1915,9 +1951,11 @@ async def start_unlink_user_ui(message: types.Message):
     user = message.from_user
     is_admin = user.id in ADMIN_IDS
     if not is_admin and user.id != ws["owner_tg_id"]:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "Отвязывать сотрудников может только владелец склада или администратор.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -1939,10 +1977,10 @@ async def start_unlink_user_ui(message: types.Message):
         )
 
     if not buttons:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             f"На складе **«{ws['title']}»** нет сотрудников для отвязки.",
-            reply_markup=get_main_keyboard(has_workspace=True),
-            parse_mode="Markdown",
+            has_workspace=True,
         )
         return
 
@@ -1984,9 +2022,11 @@ async def process_unlink_member(callback: types.CallbackQuery):
         f"✅ Сотрудник **{label}** отвязан от склада **«{ws['title']}»**.",
         parse_mode="Markdown",
     )
-    await callback.message.answer(
+    await send_with_fresh_keyboard(
+        callback.message,
         "Главное меню:",
-        reply_markup=get_main_keyboard(has_workspace=True),
+        has_workspace=True,
+        parse_mode=None,
     )
     await callback.answer()
 
@@ -2025,9 +2065,11 @@ async def process_unlink_pending(callback: types.CallbackQuery):
             f"✅ Приглашение для **@{uname}** на склад **«{ws['title']}»** отменено.",
             parse_mode="Markdown",
         )
-    await callback.message.answer(
+    await send_with_fresh_keyboard(
+        callback.message,
         "Главное меню:",
-        reply_markup=get_main_keyboard(has_workspace=True),
+        has_workspace=True,
+        parse_mode=None,
     )
     await callback.answer()
 
@@ -2041,7 +2083,7 @@ async def admin_list_workspaces(message: types.Message):
         await message.answer("Пока не создано ни одного рабочего пространства.")
         return
 
-    lines = ["👑 **Все склады (Админ):**\n"]
+    lines = [f"👑 **Все склады (Админ)** · сборка `{BOT_VERSION}`:\n"]
     buttons = []
     for r in rows[:20]:
         lines.append(
@@ -2074,9 +2116,11 @@ async def admin_switch_workspace(callback: types.CallbackQuery):
             f"✅ Вы переключились на склад **«{title}»**.",
             parse_mode="Markdown",
         )
-        await callback.message.answer(
+        await send_with_fresh_keyboard(
+            callback.message,
             "Главное меню:",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
     else:
         await callback.message.edit_text("Склад не найден.")
@@ -2150,10 +2194,10 @@ async def process_import_stock_file(message: types.Message, state: FSMContext):
         for e in parse_errors[:5]:
             lines.append(f"• {e}")
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "\n".join(lines),
-        reply_markup=get_main_keyboard(has_workspace=True),
-        parse_mode="Markdown",
+        has_workspace=True,
     )
 
 
@@ -2279,13 +2323,13 @@ async def save_catalog_item(message_or_call, state: FSMContext, category: str):
     await state.clear()
     if isinstance(message_or_call, types.CallbackQuery):
         await message_or_call.message.edit_text(result_text, parse_mode="Markdown")
-        await message_or_call.message.answer("Главное меню:", reply_markup=get_main_keyboard(has_workspace=True))
+        await send_with_fresh_keyboard(message_or_call.message, "Главное меню:", has_workspace=True, parse_mode=None)
         await message_or_call.answer()
     else:
-        await message_or_call.answer(
+        await send_with_fresh_keyboard(
+            message_or_call,
             result_text,
-            reply_markup=get_main_keyboard(has_workspace=True),
-            parse_mode="Markdown",
+            has_workspace=True,
         )
 
 
@@ -2307,9 +2351,11 @@ async def start_edit_catalog_item(message: types.Message, state: FSMContext):
 
     catalog = db_get_catalog(ws["id"])
     if not catalog:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "В справочнике пока нет позиций для редактирования.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -2492,10 +2538,10 @@ async def finish_edit_catalog_item(message_or_call, state: FSMContext, raw_categ
 
     if isinstance(message_or_call, types.CallbackQuery):
         await message_or_call.message.edit_text(res, parse_mode="Markdown")
-        await message_or_call.message.answer("Главное меню:", reply_markup=get_main_keyboard(has_workspace=True))
+        await send_with_fresh_keyboard(message_or_call.message, "Главное меню:", has_workspace=True, parse_mode=None)
         await message_or_call.answer()
     else:
-        await message_or_call.answer(res, reply_markup=get_main_keyboard(has_workspace=True), parse_mode="Markdown")
+        await send_with_fresh_keyboard(message_or_call, res, has_workspace=True)
 
 
 @dp.callback_query(EditCatalogStates.entering_category, F.data.startswith("ecat:"))
@@ -2798,7 +2844,7 @@ async def confirm_save_handler(callback: types.CallbackQuery, state: FSMContext)
 
     await state.clear()
     await callback.message.edit_text(summary, parse_mode="Markdown")
-    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard(has_workspace=True))
+    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True, parse_mode=None)
     await callback.answer()
 
 
@@ -2810,7 +2856,12 @@ async def start_repeat_last_operation(message: types.Message, state: FSMContext)
         return
     rows = db_get_recent_movements(ws["id"], limit=1)
     if not rows:
-        await message.answer("На этом складе пока нет операций для повтора.", reply_markup=get_main_keyboard(has_workspace=True))
+        await send_with_fresh_keyboard(
+            message,
+            "На этом складе пока нет операций для повтора.",
+            has_workspace=True,
+            parse_mode=None,
+        )
         return
 
     last = rows[0]
@@ -2925,7 +2976,7 @@ async def confirm_repeat_operation(callback: types.CallbackQuery, state: FSMCont
     )
     await state.clear()
     await callback.message.edit_text("✅ Операция повторена и записана!")
-    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard(has_workspace=True))
+    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True, parse_mode=None)
     await callback.answer()
 
 
@@ -2938,9 +2989,11 @@ async def choose_operation_to_cancel(message: types.Message):
 
     rows = db_get_recent_movements(ws["id"], limit=10)
     if not rows:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "На этом складе пока нет операций для отмены.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -2978,7 +3031,7 @@ async def process_cancel_selected_operation(callback: types.CallbackQuery):
         return
 
     await callback.message.edit_text(f"🗑 Операция отменена (сохранена в журнале отмен): **{info}**", parse_mode="Markdown")
-    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard(has_workspace=True))
+    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True, parse_mode=None)
     await callback.answer()
 
 
@@ -3025,6 +3078,14 @@ async def hist_show_last_cb(callback: types.CallbackQuery):
     lines = [f"📜 **Последние 10 операций («{ws['title']}»):**\n"]
     lines.extend(format_movements_lines(rows, callback.message.chat, is_admin))
     await callback.message.edit_text("\n".join(lines), parse_mode="Markdown")
+    await send_with_fresh_keyboard(
+        callback.message,
+        "Выберите следующее действие:",
+        has_workspace=True,
+        is_admin=is_admin,
+        in_menu=True,
+        parse_mode=None,
+    )
     await callback.answer()
 
 
@@ -3068,19 +3129,35 @@ async def hist_by_date_cb(callback: types.CallbackQuery):
         await callback.answer()
         return
 
+    is_admin = callback.from_user.id in ADMIN_IDS
     rows = db_get_movements_by_date(ws_id, date_str, limit=30)
     if not rows:
         await callback.message.edit_text(
             f"📅 За **{date_str}** на складе **«{ws['title']}»** операций не найдено.",
             parse_mode="Markdown",
         )
+        await send_with_fresh_keyboard(
+            callback.message,
+            "Выберите следующее действие:",
+            has_workspace=True,
+            is_admin=is_admin,
+            in_menu=True,
+            parse_mode=None,
+        )
         await callback.answer()
         return
 
-    is_admin = callback.from_user.id in ADMIN_IDS
     lines = [f"📅 **Операции за {date_str} («{ws['title']}»):**\n"]
     lines.extend(format_movements_lines(rows, callback.message.chat, is_admin))
     await callback.message.edit_text("\n".join(lines), parse_mode="Markdown")
+    await send_with_fresh_keyboard(
+        callback.message,
+        "Выберите следующее действие:",
+        has_workspace=True,
+        is_admin=is_admin,
+        in_menu=True,
+        parse_mode=None,
+    )
     await callback.answer()
 
 
@@ -3113,24 +3190,32 @@ async def hist_custom_date_process(message: types.Message, state: FSMContext):
     ws_id = int(data["hist_ws_id"])
     ws = db_get_workspace_info(ws_id)
     await state.clear()
+    is_admin = message.from_user.id in ADMIN_IDS
 
     if not ws:
-        await message.answer("Склад не найден.", reply_markup=get_main_keyboard(has_workspace=True))
+        await send_with_fresh_keyboard(message, "Склад не найден.", has_workspace=True, parse_mode=None)
         return
 
     rows = db_get_movements_by_date(ws_id, date_str, limit=30)
     if not rows:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             f"📅 За **{date_str}** на складе **«{ws['title']}»** операций не найдено.",
-            reply_markup=get_main_keyboard(has_workspace=True),
-            parse_mode="Markdown",
+            has_workspace=True,
+            is_admin=is_admin,
+            in_menu=True,
         )
         return
 
-    is_admin = message.from_user.id in ADMIN_IDS
     lines = [f"📅 **Операции за {date_str} («{ws['title']}»):**\n"]
     lines.extend(format_movements_lines(rows, message.chat, is_admin))
-    await message.answer("\n".join(lines), reply_markup=get_main_keyboard(has_workspace=True), parse_mode="Markdown")
+    await send_with_fresh_keyboard(
+        message,
+        "\n".join(lines),
+        has_workspace=True,
+        is_admin=is_admin,
+        in_menu=True,
+    )
 
 
 @dp.callback_query(F.data.startswith("hist_item_menu:"))
@@ -3242,6 +3327,7 @@ async def hist_by_item_cb(callback: types.CallbackQuery):
         await callback.answer()
         return
 
+    is_admin = callback.from_user.id in ADMIN_IDS
     rows = db_get_movements_by_item(ws_id, item_name, limit=25)
     stock_list = db_get_stock(ws_id)
     item_stock = next((x for x in stock_list if x["name"].lower() == item_name.lower()), None)
@@ -3256,16 +3342,31 @@ async def hist_by_item_cb(callback: types.CallbackQuery):
             f"Операций по этой позиции пока не было.",
             parse_mode="Markdown",
         )
+        await send_with_fresh_keyboard(
+            callback.message,
+            "Выберите следующее действие:",
+            has_workspace=True,
+            is_admin=is_admin,
+            in_menu=True,
+            parse_mode=None,
+        )
         await callback.answer()
         return
 
-    is_admin = callback.from_user.id in ADMIN_IDS
     lines = [
         f"📦 **История по позиции «{item_name}» («{ws['title']}»)**",
         f"Текущий остаток: **{cur_bal:g}**{unit_str}\n",
     ]
     lines.extend(format_movements_lines(rows, callback.message.chat, is_admin))
     await callback.message.edit_text("\n".join(lines), parse_mode="Markdown")
+    await send_with_fresh_keyboard(
+        callback.message,
+        "Выберите следующее действие:",
+        has_workspace=True,
+        is_admin=is_admin,
+        in_menu=True,
+        parse_mode=None,
+    )
     await callback.answer()
 
 
@@ -3303,9 +3404,11 @@ async def show_stock(message: types.Message):
         return
     stock_list = db_get_stock(ws["id"])
     if not stock_list:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "В справочнике пока нет позиций. Нажмите «📝 Добавить позицию» или «📤 Загрузить остатки из Excel».",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -3320,10 +3423,10 @@ async def show_stock(message: types.Message):
             mark = "• "
         lines.append(f"{mark}**{item['name']}**: {item['balance']:g}{unit_str}")
 
-    await message.answer(
+    await send_with_fresh_keyboard(
+        message,
         "\n".join(lines),
-        reply_markup=get_main_keyboard(has_workspace=True),
-        parse_mode="Markdown",
+        has_workspace=True,
     )
 
 
@@ -3335,9 +3438,11 @@ async def export_stock_excel(message: types.Message):
 
     stock_list = db_get_stock(ws["id"])
     if not stock_list:
-        await message.answer(
+        await send_with_fresh_keyboard(
+            message,
             "В справочнике пока нет позиций для выгрузки.",
-            reply_markup=get_main_keyboard(has_workspace=True),
+            has_workspace=True,
+            parse_mode=None,
         )
         return
 
@@ -3364,6 +3469,12 @@ async def export_stock_excel(message: types.Message):
             ),
             reply_markup=get_main_keyboard(has_workspace=True),
         )
+
+
+@dp.startup()
+async def on_startup():
+    logging.info(f"Бот запущен. Версия сборки: {BOT_VERSION}")
+    await notify_admins(f"🚀 **Бот запущен**\nВерсия сборки: `{BOT_VERSION}`")
 
 
 async def main():
