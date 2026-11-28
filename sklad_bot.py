@@ -41,7 +41,7 @@ ADMIN_IDS: set[int] = {
     if x.strip().isdigit()
 }
 LOW_STOCK_THRESHOLD = 0.0
-BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-import-movements-xlsx")
+BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-new-item-change-category-in-list")
 
 logging.basicConfig(level=logging.INFO)
 if not BOT_TOKEN:
@@ -746,15 +746,17 @@ def db_catalog_name_exists(workspace_id: int, name: str, exclude_id: Optional[in
     return row is not None
 
 
-def db_add_catalog_item(workspace_id: int, name: str, unit: str, category: str):
+def db_add_catalog_item(workspace_id: int, name: str, unit: str, category: str) -> int:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO catalog_items (workspace_id, name, unit, category) VALUES (?, ?, ?, ?)",
         (workspace_id, name, unit, category),
     )
+    item_id = int(cur.lastrowid)
     conn.commit()
     conn.close()
+    return item_id
 
 
 def db_update_catalog_item(
@@ -1282,7 +1284,6 @@ def parse_uploaded_movements_file(file_bytes: bytes, filename: str) -> tuple[lis
     if io_errors:
         return [], io_errors
 
-    # Поддерживаемые заголовки: Дата | Тип | Наименование | Количество | Категория | Ед. измерения | Комментарий
     col_map: dict[str, int] = {
         "op_date": 0,
         "op_type": 1,
@@ -1516,8 +1517,12 @@ class OperationStates(StatesGroup):
     choosing_date = State()
     entering_custom_date = State()
     choosing_category = State()
+    choosing_new_item_category = State()
+    entering_new_item_category_text = State()
     searching_item = State()
     choosing_item = State()
+    entering_new_item_name = State()
+    entering_new_item_unit = State()
     entering_quantity = State()
     entering_comment = State()
     confirming = State()
@@ -2910,11 +2915,6 @@ async def show_items_or_categories(target_message: types.Message, state: FSMCont
     ws_id = int(data["workspace_id"])
     op_type = data["op_type"]
     catalog = db_get_catalog(ws_id)
-    if not catalog:
-        await target_message.answer(
-            "В справочнике пока нет товаров. Нажмите «📝 Добавить позицию» или «📤 Загрузить остатки из Excel»."
-        )
-        return
     categories = []
     for c in catalog:
         if c["category"] not in categories:
@@ -2928,19 +2928,23 @@ async def show_items_or_categories(target_message: types.Message, state: FSMCont
         ]
         buttons.append([InlineKeyboardButton(text="📋 Все позиции списком", callback_data="opcat_all")])
         buttons.append([InlineKeyboardButton(text="🔍 Поиск позиции", callback_data="op_search")])
+        buttons.append([InlineKeyboardButton(text="✍️ Новая позиция", callback_data="op_new_item_cat")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
         await state.set_state(OperationStates.choosing_category)
         text = f"Операция: <b>{esc(op_type)}</b> · Дата: <b>{esc(op_date)}</b>\nВыберите категорию:"
     else:
+        default_cat = categories[0] if categories else "Основное"
+        await state.update_data(op_selected_category=default_cat, op_has_explicit_category=bool(categories))
         buttons = [
             [InlineKeyboardButton(text=item["name"], callback_data=f"item_id:{item['id']}")]
             for item in catalog[:30]
         ]
         if len(catalog) > 8:
             buttons.append([InlineKeyboardButton(text="🔍 Поиск позиции", callback_data="op_search")])
+        buttons.append([InlineKeyboardButton(text="✍️ Новая позиция", callback_data="op_new_item")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
         await state.set_state(OperationStates.choosing_item)
-        text = f"Операция: <b>{esc(op_type)}</b> · Дата: <b>{esc(op_date)}</b>\nВыберите позицию:"
+        text = f"Операция: <b>{esc(op_type)}</b> · Дата: <b>{esc(op_date)}</b>\nВыберите позицию или добавьте новую:"
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit:
         await target_message.edit_text(text, reply_markup=markup)
@@ -2948,8 +2952,208 @@ async def show_items_or_categories(target_message: types.Message, state: FSMCont
         await target_message.answer(text, reply_markup=markup)
 
 
+async def _show_new_item_category_picker(target_message: types.Message, state: FSMContext, edit: bool = False):
+    data = await state.get_data()
+    categories = data.get("op_categories") or []
+    if not categories:
+        ws_id = int(data["workspace_id"])
+        for item in db_get_catalog(ws_id):
+            c = item["category"].strip()
+            if c and c not in categories:
+                categories.append(c)
+        await state.update_data(op_categories=categories)
+
+    rows = [
+        [InlineKeyboardButton(text=cat, callback_data=f"op_nicat_idx:{idx}")]
+        for idx, cat in enumerate(categories[:25])
+    ]
+    rows.append([InlineKeyboardButton(text="✍️ Своя категория", callback_data="op_nicat_custom")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="back_to_cats")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    await state.set_state(OperationStates.choosing_new_item_category)
+    text = "Выберите <b>категорию</b> для новой позиции или введите свою:"
+    if edit:
+        await target_message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    else:
+        await target_message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+async def _ask_new_item_name_for_category(target_message: types.Message, state: FSMContext, category: str, edit: bool = False):
+    cat_clean = " ".join((category or "").strip().split()) or "Основное"
+    await state.update_data(op_selected_category=cat_clean, inline_new_category=cat_clean)
+    await state.set_state(OperationStates.entering_new_item_name)
+    text = (
+        f"Категория: <b>{esc(cat_clean)}</b>\n"
+        f"Введите <b>название новой позиции</b> текстом (например: <code>Шоколадка</code>):"
+    )
+    if edit:
+        await target_message.edit_text(text)
+    else:
+        await target_message.answer(text, reply_markup=get_cancel_keyboard())
+
+
+@dp.callback_query(OperationStates.choosing_category, F.data == "op_new_item_cat")
+async def start_new_item_pick_category_cb(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _show_new_item_category_picker(callback.message, state, edit=True)
+
+
+@dp.callback_query(OperationStates.choosing_new_item_category, F.data.startswith("op_nicat_idx:"))
+async def process_new_item_category_idx_cb(callback: types.CallbackQuery, state: FSMContext):
+    idx = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    categories = data.get("op_categories") or []
+    if 0 <= idx < len(categories):
+        await callback.answer()
+        await _ask_new_item_name_for_category(callback.message, state, categories[idx], edit=True)
+    else:
+        await callback.answer("Категория не найдена", show_alert=True)
+
+
+@dp.callback_query(OperationStates.choosing_new_item_category, F.data == "op_nicat_custom")
+async def process_new_item_custom_category_cb(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(OperationStates.entering_new_item_category_text)
+    await callback.message.edit_text("Введите <b>название категории</b> текстом (например: <code>Еда</code>):")
+    await callback.answer()
+
+
+@dp.message(OperationStates.entering_new_item_category_text)
+async def process_new_item_custom_category_text(message: types.Message, state: FSMContext):
+    cat_text = " ".join((message.text or "").strip().split())
+    if not cat_text:
+        await message.answer("Категория не может быть пустой. Введите название категории:", reply_markup=get_cancel_keyboard())
+        return
+    await _ask_new_item_name_for_category(message, state, cat_text, edit=False)
+
+
+@dp.callback_query(F.data == "op_new_item")
+async def start_inline_new_item_cb(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    has_explicit_cat = bool(data.get("op_has_explicit_category"))
+    cat_label = data.get("op_selected_category") or "Основное"
+
+    if has_explicit_cat:
+        rows = [
+            [InlineKeyboardButton(text=f"✅ В категорию «{cat_label}»", callback_data="op_nicat_current")],
+            [InlineKeyboardButton(text="🔄 Сменить категорию", callback_data="op_nicat_change")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]
+        await callback.message.edit_text(
+            f"Создание новой позиции.\nТекущая категория: <b>{esc(cat_label)}</b>\n"
+            f"Оставить её или выбрать/ввести другую?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        await callback.answer()
+        return
+
+    await callback.answer()
+    await _show_new_item_category_picker(callback.message, state, edit=True)
+
+
+@dp.callback_query(F.data == "op_nicat_current")
+async def confirm_current_new_item_category_cb(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cat_label = data.get("op_selected_category") or "Основное"
+    await callback.answer()
+    await _ask_new_item_name_for_category(callback.message, state, cat_label, edit=True)
+
+
+@dp.callback_query(F.data == "op_nicat_change")
+async def change_new_item_category_cb(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _show_new_item_category_picker(callback.message, state, edit=True)
+
+
+@dp.message(OperationStates.entering_new_item_name)
+async def process_inline_new_item_name(message: types.Message, state: FSMContext):
+    new_name = " ".join((message.text or "").strip().split())
+    if not new_name:
+        await message.answer("Название не может быть пустым. Введите название новой позиции:", reply_markup=get_cancel_keyboard())
+        return
+
+    data = await state.get_data()
+    ws_id = int(data["workspace_id"])
+    if db_catalog_name_exists(ws_id, new_name):
+        await message.answer(
+            f"Позиция <b>«{esc(new_name)}»</b> уже есть в справочнике. Введите другое название:",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    cat_label = data.get("inline_new_category") or data.get("op_selected_category") or "Основное"
+    await state.update_data(inline_new_name=new_name, inline_new_category=cat_label)
+    await state.set_state(OperationStates.entering_new_item_unit)
+
+    unit_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="шт", callback_data="op_nunit:шт"),
+                InlineKeyboardButton(text="кг", callback_data="op_nunit:кг"),
+                InlineKeyboardButton(text="литр", callback_data="op_nunit:литр"),
+                InlineKeyboardButton(text="м", callback_data="op_nunit:м"),
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]
+    )
+    await message.answer(
+        f"Новая позиция: <b>{esc(new_name)}</b> (категория: <b>{esc(cat_label)}</b>)\n"
+        f"Выберите <b>единицу измерения</b> кнопкой или введите текстом:",
+        reply_markup=unit_markup,
+    )
+
+
+async def _create_inline_item_and_ask_qty(target_message: types.Message, state: FSMContext, unit: str, edit: bool = False):
+    data = await state.get_data()
+    ws_id = int(data["workspace_id"])
+    name = data["inline_new_name"]
+    category = data.get("inline_new_category") or "Основное"
+    unit_clean = (unit or "").strip() or "шт"
+
+    try:
+        db_add_catalog_item(ws_id, name, unit_clean, category)
+    except Exception as e:
+        err_text = f"❌ Не удалось создать позицию: {esc(e)}"
+        if edit:
+            await target_message.edit_text(err_text)
+        else:
+            await target_message.answer(err_text, reply_markup=get_cancel_keyboard())
+        return
+
+    await state.update_data(
+        item_name=name,
+        item_unit=unit_clean,
+        item_category=category,
+    )
+    await state.set_state(OperationStates.entering_quantity)
+    msg_text = (
+        f"✅ Позиция <b>{esc(name)}</b> ({esc(unit_clean)}, категория <b>{esc(category)}</b>) добавлена!\n"
+        f"Введите количество (числом):"
+    )
+    if edit:
+        await target_message.edit_text(msg_text)
+    else:
+        await target_message.answer(msg_text, reply_markup=get_cancel_keyboard())
+
+
+@dp.callback_query(OperationStates.entering_new_item_unit, F.data.startswith("op_nunit:"))
+async def process_inline_new_item_unit_cb(callback: types.CallbackQuery, state: FSMContext):
+    unit = callback.data.split(":", 1)[1]
+    await callback.answer()
+    await _create_inline_item_and_ask_qty(callback.message, state, unit, edit=True)
+
+
+@dp.message(OperationStates.entering_new_item_unit)
+async def process_inline_new_item_unit_text(message: types.Message, state: FSMContext):
+    unit = (message.text or "").strip()
+    if not unit:
+        await message.answer("Введите единицу измерения текстом или выберите кнопку выше:", reply_markup=get_cancel_keyboard())
+        return
+    await _create_inline_item_and_ask_qty(message, state, unit, edit=False)
+
+
 @dp.callback_query(F.data == "op_search")
 async def start_item_search_cb(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(op_has_explicit_category=False)
     await state.set_state(OperationStates.searching_item)
     await callback.message.edit_text("🔍 Введите часть названия позиции для поиска:")
     await callback.answer()
@@ -2966,14 +3170,20 @@ async def process_item_search_text(message: types.Message, state: FSMContext):
     matches = [x for x in catalog if query in x["name"].lower()]
     if not matches:
         await message.answer(
-            f"По запросу <b>«{esc(message.text.strip())}»</b> ничего не найдено. Введите другой запрос или нажмите «❌ Отмена»:",
-            reply_markup=get_cancel_keyboard(),
+            f"По запросу <b>«{esc(message.text.strip())}»</b> ничего не найдено. Введите другой запрос, нажмите «❌ Отмена» или создайте новую позицию:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✍️ Новая позиция", callback_data="op_new_item")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+                ]
+            ),
         )
         return
     buttons = [
         [InlineKeyboardButton(text=x["name"], callback_data=f"item_id:{x['id']}")]
         for x in matches[:25]
     ]
+    buttons.append([InlineKeyboardButton(text="✍️ Новая позиция", callback_data="op_new_item")])
     buttons.append([InlineKeyboardButton(text="🔍 Искать снова", callback_data="op_search")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     await state.set_state(OperationStates.choosing_item)
@@ -3007,16 +3217,22 @@ async def process_custom_date(message: types.Message, state: FSMContext):
 
 
 async def _open_op_items_for_category(callback: types.CallbackQuery, state: FSMContext, cat_label: str, items: list[dict]):
+    has_explicit_cat = cat_label != "Все позиции"
+    await state.update_data(
+        op_selected_category=cat_label if has_explicit_cat else "Основное",
+        op_has_explicit_category=has_explicit_cat,
+    )
     buttons = [
         [InlineKeyboardButton(text=x["name"], callback_data=f"item_id:{x['id']}")]
         for x in items[:30]
     ]
+    buttons.append([InlineKeyboardButton(text="✍️ Новая позиция", callback_data="op_new_item")])
     buttons.append([InlineKeyboardButton(text="🔍 Поиск позиции", callback_data="op_search")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="back_to_cats")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     await state.set_state(OperationStates.choosing_item)
     await callback.message.edit_text(
-        f"Категория: <b>{esc(cat_label)}</b>\nВыберите номенклатуру:",
+        f"Категория: <b>{esc(cat_label)}</b>\nВыберите номенклатуру или добавьте новую:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
@@ -3043,7 +3259,7 @@ async def process_op_category_all(callback: types.CallbackQuery, state: FSMConte
     await _open_op_items_for_category(callback, state, "Все позиции", catalog)
 
 
-@dp.callback_query(OperationStates.choosing_item, F.data == "back_to_cats")
+@dp.callback_query(F.data == "back_to_cats")
 async def back_to_categories(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await show_items_or_categories(callback.message, state, data["op_date"], edit=True)
