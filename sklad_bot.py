@@ -41,7 +41,7 @@ ADMIN_IDS: set[int] = {
     if x.strip().isdigit()
 }
 LOW_STOCK_THRESHOLD = 0.0
-BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-safe-cb-html")
+BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-stock-picker-no-repeat")
 
 logging.basicConfig(level=logging.INFO)
 if not BOT_TOKEN:
@@ -806,6 +806,7 @@ def db_get_stock(workspace_id: int) -> list[dict]:
     rows = cur.execute(
         """
         SELECT
+            c.id AS id,
             c.name AS name,
             c.unit AS unit,
             c.category AS category,
@@ -828,7 +829,13 @@ def db_get_stock(workspace_id: int) -> list[dict]:
     ).fetchall()
     conn.close()
     return [
-        {"name": r["name"], "unit": r["unit"], "category": r["category"], "balance": float(r["balance"])}
+        {
+            "id": int(r["id"]),
+            "name": r["name"],
+            "unit": r["unit"],
+            "category": r["category"],
+            "balance": float(r["balance"]),
+        }
         for r in rows
     ]
 
@@ -1118,6 +1125,21 @@ def format_movements_lines(rows: list[sqlite3.Row], chat: types.Chat, is_admin: 
     return lines
 
 
+def format_stock_lines(ws_title: str, stock_list: list[dict], heading: Optional[str] = None) -> str:
+    title_line = heading or f"📦 <b>Текущие остатки («{esc(ws_title)}»):</b>"
+    lines = [title_line, ""]
+    for item in stock_list:
+        unit_str = f" {esc(item['unit'])}" if item["unit"] else ""
+        if item["balance"] < 0:
+            mark = "🔴 "
+        elif item["balance"] == 0:
+            mark = "🟡 "
+        else:
+            mark = "• "
+        lines.append(f"{mark}<b>{esc(item['name'])}</b>: {item['balance']:g}{unit_str}")
+    return "\n".join(lines)
+
+
 def parse_number(raw: str) -> Optional[float]:
     try:
         return float(raw.replace(",", ".").replace(" ", "").strip())
@@ -1274,6 +1296,10 @@ def build_stock_csv_bytes(ws_title: str, stock_list: list[dict]) -> bytes:
     return sio.getvalue().encode("utf-8-sig")
 
 
+class StockFilterStates(StatesGroup):
+    searching_item = State()
+
+
 class HistoryFilterStates(StatesGroup):
     entering_date = State()
     searching_item = State()
@@ -1287,12 +1313,6 @@ class OperationStates(StatesGroup):
     choosing_item = State()
     entering_quantity = State()
     entering_comment = State()
-    confirming = State()
-
-
-class RepeatOperationStates(StatesGroup):
-    choosing_date = State()
-    entering_custom_date = State()
     confirming = State()
 
 
@@ -1342,8 +1362,7 @@ def get_main_keyboard(has_workspace: bool) -> ReplyKeyboardMarkup:
 def get_menu_list_keyboard(has_workspace: bool, is_admin: bool) -> ReplyKeyboardMarkup:
     rows: list[list[KeyboardButton]] = []
     if has_workspace:
-        rows.append([KeyboardButton(text="📜 Последние операции"), KeyboardButton(text="🔁 Повторить последнюю")])
-        rows.append([KeyboardButton(text="🗑 Отменить операцию")])
+        rows.append([KeyboardButton(text="📜 Последние операции"), KeyboardButton(text="🗑 Отменить операцию")])
         rows.append([KeyboardButton(text="📤 Загрузить остатки из Excel")])
         rows.append([KeyboardButton(text="📥 Остатки в Excel")])
         rows.append([KeyboardButton(text="✏️ Редактировать позицию")])
@@ -2574,7 +2593,7 @@ async def process_edit_category_text(message: types.Message, state: FSMContext):
     await finish_edit_catalog_item(message, state, message.text or "")
 
 
-# --- ПРИХОД, РАСХОД И БЫСТРЫЙ ПОВТОР ---
+# --- ПРИХОД И РАСХОД ---
 @dp.message(F.text.in_(["➕ Приход", "➖ Расход"]))
 async def start_operation(message: types.Message, state: FSMContext):
     ws = await ensure_workspace(message)
@@ -2901,134 +2920,6 @@ async def confirm_save_handler(callback: types.CallbackQuery, state: FSMContext)
 
     await state.clear()
     await callback.message.edit_text(summary)
-    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True)
-    await callback.answer()
-
-
-# --- БЫСТРЫЙ ПОВТОР ПОСЛЕДНЕЙ ОПЕРАЦИИ ---
-@dp.message(F.text == "🔁 Повторить последнюю")
-async def start_repeat_last_operation(message: types.Message, state: FSMContext):
-    ws = await ensure_workspace(message)
-    if not ws:
-        return
-    rows = db_get_recent_movements(ws["id"], limit=1)
-    if not rows:
-        await send_with_fresh_keyboard(
-            message,
-            "На этом складе пока нет операций для повтора.",
-            has_workspace=True,
-        )
-        return
-
-    last = rows[0]
-    await state.clear()
-    await state.update_data(
-        workspace_id=ws["id"],
-        op_type=last["op_type"],
-        item_name=last["item_name"],
-        quantity=float(last["quantity"]),
-        item_unit=last["unit"],
-        item_category=last["category"],
-        comment=last["comment"],
-    )
-    today_str = datetime.now().strftime("%d.%m.%Y")
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Сегодня ({today_str})", callback_data=f"repdate:{today_str}")],
-            [InlineKeyboardButton(text="📅 Другая дата", callback_data="repdate:custom")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
-        ]
-    )
-    await state.set_state(RepeatOperationStates.choosing_date)
-    unit_str = f" {esc(last['unit'])}" if last["unit"] else ""
-    await message.answer(
-        f"🔁 <b>Повтор последней операции:</b>\n"
-        f"• {esc(last['op_type'])}: <b>{esc(last['item_name'])}</b> — <b>{float(last['quantity']):g}</b>{unit_str}\n"
-        f"Выберите дату для новой записи:",
-        reply_markup=markup,
-    )
-
-
-@dp.callback_query(RepeatOperationStates.choosing_date, F.data.startswith("repdate:"))
-async def process_repeat_date_cb(callback: types.CallbackQuery, state: FSMContext):
-    val = callback.data.split(":", 1)[1]
-    if val == "custom":
-        await state.set_state(RepeatOperationStates.entering_custom_date)
-        await callback.message.edit_text("Введите дату в формате <code>ДД.ММ.ГГГГ</code> (например: <code>28.11.2026</code>):")
-        await callback.answer()
-        return
-
-    await state.update_data(op_date=val)
-    await state.set_state(RepeatOperationStates.confirming)
-    data = await state.get_data()
-    unit_str = f" {esc(data['item_unit'])}" if data.get("item_unit") else ""
-    confirm_markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Записать", callback_data="rep_confirm")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
-        ]
-    )
-    await callback.message.edit_text(
-        f"🔎 <b>Подтвердите повтор операции:</b>\n"
-        f"• Дата: <b>{esc(val)}</b>\n"
-        f"• Операция: <b>{esc(data['op_type'])}</b>\n"
-        f"• Позиция: <b>{esc(data['item_name'])}</b>\n"
-        f"• Количество: <b>{float(data['quantity']):g}</b>{unit_str}\n"
-        f"• Комментарий: {esc(data['comment']) if data.get('comment') else '—'}",
-        reply_markup=confirm_markup,
-    )
-    await callback.answer()
-
-
-@dp.message(RepeatOperationStates.entering_custom_date)
-async def process_repeat_custom_date(message: types.Message, state: FSMContext):
-    raw = (message.text or "").strip()
-    try:
-        date_str = datetime.strptime(raw, "%d.%m.%Y").strftime("%d.%m.%Y")
-    except ValueError:
-        await message.answer("Неверный формат даты. Введите как <code>ДД.ММ.ГГГГ</code>:")
-        return
-
-    await state.update_data(op_date=date_str)
-    await state.set_state(RepeatOperationStates.confirming)
-    data = await state.get_data()
-    unit_str = f" {esc(data['item_unit'])}" if data.get("item_unit") else ""
-    confirm_markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Записать", callback_data="rep_confirm")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
-        ]
-    )
-    await message.answer(
-        f"🔎 <b>Подтвердите повтор операции:</b>\n"
-        f"• Дата: <b>{esc(date_str)}</b>\n"
-        f"• Операция: <b>{esc(data['op_type'])}</b>\n"
-        f"• Позиция: <b>{esc(data['item_name'])}</b>\n"
-        f"• Количество: <b>{float(data['quantity']):g}</b>{unit_str}\n"
-        f"• Комментарий: {esc(data['comment']) if data.get('comment') else '—'}",
-        reply_markup=confirm_markup,
-    )
-
-
-@dp.callback_query(RepeatOperationStates.confirming, F.data == "rep_confirm")
-async def confirm_repeat_operation(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    user = callback.from_user
-    actor_name = user.full_name or (f"@{user.username}" if user.username else "Пользователь")
-    db_add_movement(
-        int(data["workspace_id"]),
-        data["op_date"],
-        data["op_type"],
-        data["item_name"],
-        float(data["quantity"]),
-        data.get("item_unit", ""),
-        data.get("item_category", ""),
-        data.get("comment", ""),
-        actor_name,
-        user.id,
-    )
-    await state.clear()
-    await callback.message.edit_text("✅ Операция повторена и записана!")
     await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True)
     await callback.answer()
 
@@ -3463,8 +3354,43 @@ async def hist_back_cb(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# --- ОСТАТКИ: ВЕСЬ СПИСОК, ПО КАТЕГОРИИ, ПОИСК И ВЫБОР ПОЗИЦИИ ---
+async def _build_stock_picker_markup(ws_id: int, stock_list: list[dict], state: FSMContext) -> InlineKeyboardMarkup:
+    categories = []
+    for item in stock_list:
+        c = item["category"]
+        if c not in categories:
+            categories.append(c)
+
+    await state.update_data(stock_ws_id=ws_id, stock_categories=categories, stock_items=stock_list)
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="📋 Весь список", callback_data=f"stk_all:{ws_id}")]
+    ]
+    if len(categories) > 1:
+        for idx, cat in enumerate(categories[:12]):
+            buttons.append([InlineKeyboardButton(text=f"📁 {cat}", callback_data=f"stk_cat:{ws_id}:{idx}")])
+        buttons.append([InlineKeyboardButton(text="🔍 Поиск позиции", callback_data=f"stk_search:{ws_id}")])
+    else:
+        for item in stock_list[:25]:
+            unit_part = f" {item['unit']}" if item["unit"] else ""
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{item['name']} ({item['balance']:g}{unit_part})",
+                        callback_data=f"stk_item:{ws_id}:{item['id']}",
+                    )
+                ]
+            )
+        if len(stock_list) > 8:
+            buttons.append([InlineKeyboardButton(text="🔍 Поиск позиции", callback_data=f"stk_search:{ws_id}")])
+
+    buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.message(F.text == "📊 Текущий остаток")
-async def show_stock(message: types.Message):
+async def show_stock(message: types.Message, state: FSMContext):
     ws = await ensure_workspace(message)
     if not ws:
         return
@@ -3477,22 +3403,238 @@ async def show_stock(message: types.Message):
         )
         return
 
-    lines = [f"📦 <b>Текущие остатки («{esc(ws['title'])}»):</b>\n"]
-    for item in stock_list:
-        unit_str = f" {esc(item['unit'])}" if item["unit"] else ""
-        if item["balance"] < 0:
-            mark = "🔴 "
-        elif item["balance"] == 0:
-            mark = "🟡 "
-        else:
-            mark = "• "
-        lines.append(f"{mark}<b>{esc(item['name'])}</b>: {item['balance']:g}{unit_str}")
-
-    await send_with_fresh_keyboard(
-        message,
-        "\n".join(lines),
-        has_workspace=True,
+    await state.clear()
+    markup = await _build_stock_picker_markup(ws["id"], stock_list, state)
+    await message.answer(
+        f"📊 <b>Текущие остатки («{esc(ws['title'])}»)</b>\nВыберите вариант просмотра или конкретную позицию:",
+        reply_markup=markup,
     )
+
+
+@dp.callback_query(F.data.startswith("stk_menu:"))
+async def stk_menu_cb(callback: types.CallbackQuery, state: FSMContext):
+    ws_id = int(callback.data.split(":", 1)[1])
+    ws = db_get_workspace_info(ws_id)
+    if not ws:
+        await callback.message.edit_text("Склад не найден.")
+        await callback.answer()
+        return
+
+    stock_list = db_get_stock(ws_id)
+    if not stock_list:
+        await callback.message.edit_text("В справочнике пока нет позиций.")
+        await callback.answer()
+        return
+
+    await state.clear()
+    markup = await _build_stock_picker_markup(ws_id, stock_list, state)
+    await callback.message.edit_text(
+        f"📊 <b>Текущие остатки («{esc(ws['title'])}»)</b>\nВыберите вариант просмотра или конкретную позицию:",
+        reply_markup=markup,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stk_all:"))
+async def stk_show_all_cb(callback: types.CallbackQuery, state: FSMContext):
+    ws_id = int(callback.data.split(":", 1)[1])
+    ws = db_get_workspace_info(ws_id)
+    if not ws:
+        await callback.message.edit_text("Склад не найден.")
+        await callback.answer()
+        return
+
+    stock_list = db_get_stock(ws_id)
+    await state.clear()
+    if not stock_list:
+        await callback.message.edit_text("В справочнике пока нет позиций.")
+        await callback.answer()
+        return
+
+    text = format_stock_lines(ws["title"], stock_list)
+    await callback.message.edit_text(text)
+    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stk_cat:"))
+async def stk_by_cat_cb(callback: types.CallbackQuery, state: FSMContext):
+    _, ws_id_str, idx_str = callback.data.split(":", 2)
+    ws_id = int(ws_id_str)
+    idx = int(idx_str)
+    ws = db_get_workspace_info(ws_id)
+    if not ws:
+        await callback.message.edit_text("Склад не найден.")
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    categories = data.get("stock_categories") or []
+    stock_list = data.get("stock_items") or db_get_stock(ws_id)
+    if not categories:
+        for item in stock_list:
+            if item["category"] not in categories:
+                categories.append(item["category"])
+
+    if not (0 <= idx < len(categories)):
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+
+    cat = categories[idx]
+    filtered = [x for x in stock_list if x["category"] == cat]
+    buttons = []
+    for item in filtered[:25]:
+        unit_part = f" {item['unit']}" if item["unit"] else ""
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{item['name']} ({item['balance']:g}{unit_part})",
+                    callback_data=f"stk_item:{ws_id}:{item['id']}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton(text="📋 Показать всю категорию текстом", callback_data=f"stk_cat_all:{ws_id}:{idx}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"stk_menu:{ws_id}")])
+    await callback.message.edit_text(
+        f"📁 Категория: <b>{esc(cat)}</b> («{esc(ws['title'])}»)\nВыберите позицию для просмотра остатка:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stk_cat_all:"))
+async def stk_show_cat_all_cb(callback: types.CallbackQuery, state: FSMContext):
+    _, ws_id_str, idx_str = callback.data.split(":", 2)
+    ws_id = int(ws_id_str)
+    idx = int(idx_str)
+    ws = db_get_workspace_info(ws_id)
+    if not ws:
+        await callback.message.edit_text("Склад не найден.")
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    categories = data.get("stock_categories") or []
+    stock_list = data.get("stock_items") or db_get_stock(ws_id)
+    if not categories:
+        for item in stock_list:
+            if item["category"] not in categories:
+                categories.append(item["category"])
+
+    if not (0 <= idx < len(categories)):
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+
+    cat = categories[idx]
+    filtered = [x for x in stock_list if x["category"] == cat]
+    await state.clear()
+    text = format_stock_lines(
+        ws["title"],
+        filtered,
+        heading=f"📦 <b>Остатки · {esc(cat)} («{esc(ws['title'])}»):</b>",
+    )
+    await callback.message.edit_text(text)
+    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stk_search:"))
+async def stk_search_start_cb(callback: types.CallbackQuery, state: FSMContext):
+    ws_id = int(callback.data.split(":", 1)[1])
+    await state.set_state(StockFilterStates.searching_item)
+    await state.update_data(stock_ws_id=ws_id)
+    await callback.message.edit_text("🔍 Введите часть названия позиции для просмотра остатка:")
+    await callback.answer()
+
+
+@dp.message(StockFilterStates.searching_item)
+async def stk_search_process(message: types.Message, state: FSMContext):
+    query = (message.text or "").strip().lower()
+    if not query:
+        await message.answer("Введите часть названия позиции:", reply_markup=get_cancel_keyboard())
+        return
+
+    data = await state.get_data()
+    ws_id = int(data["stock_ws_id"])
+    stock_list = db_get_stock(ws_id)
+    matches = [x for x in stock_list if query in x["name"].lower()]
+    if not matches:
+        await message.answer(
+            f"По запросу <b>«{esc(message.text.strip())}»</b> позиций не найдено. Введите другой текст или нажмите «❌ Отмена»:",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    await state.clear()
+    buttons = []
+    for item in matches[:25]:
+        unit_part = f" {item['unit']}" if item["unit"] else ""
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{item['name']} ({item['balance']:g}{unit_part})",
+                    callback_data=f"stk_item:{ws_id}:{item['id']}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="cancel")])
+    await message.answer(
+        f"Найдено позиций: <b>{len(matches)}</b>. Выберите позицию:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(F.data.startswith("stk_item:"))
+async def stk_show_single_item_cb(callback: types.CallbackQuery, state: FSMContext):
+    _, ws_id_str, item_id_str = callback.data.split(":", 2)
+    ws_id = int(ws_id_str)
+    item_id = int(item_id_str)
+    ws = db_get_workspace_info(ws_id)
+    if not ws:
+        await callback.message.edit_text("Склад не найден.")
+        await callback.answer()
+        return
+
+    stock_list = db_get_stock(ws_id)
+    item = next((x for x in stock_list if int(x["id"]) == item_id), None)
+    if not item:
+        cat_item = db_get_catalog_item(ws_id, item_id)
+        if not cat_item:
+            await callback.message.edit_text("Позиция не найдена.")
+            await callback.answer()
+            return
+        item = {
+            "id": cat_item["id"],
+            "name": cat_item["name"],
+            "unit": cat_item["unit"],
+            "category": cat_item["category"],
+            "balance": 0.0,
+        }
+
+    await state.clear()
+    unit_str = f" {esc(item['unit'])}" if item["unit"] else ""
+    if item["balance"] < 0:
+        status_line = "🔴 Отрицательный остаток"
+    elif item["balance"] == 0:
+        status_line = "🟡 Товар закончился"
+    else:
+        status_line = "🟢 В наличии"
+
+    text = (
+        f"📦 <b>{esc(item['name'])}</b>\n"
+        f"• Склад: <b>«{esc(ws['title'])}»</b>\n"
+        f"• Категория: {esc(item['category'])}\n"
+        f"• Текущий остаток: <b>{item['balance']:g}</b>{unit_str} ({status_line})"
+    )
+    back_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Выбрать другую позицию", callback_data=f"stk_menu:{ws_id}")],
+            [InlineKeyboardButton(text="📋 Весь список остатков", callback_data=f"stk_all:{ws_id}")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=back_markup)
+    await send_with_fresh_keyboard(callback.message, "Главное меню:", has_workspace=True)
+    await callback.answer()
 
 
 @dp.message(F.text == "📥 Остатки в Excel")
