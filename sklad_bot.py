@@ -41,7 +41,7 @@ ADMIN_IDS: set[int] = {
     if x.strip().isdigit()
 }
 LOW_STOCK_THRESHOLD = 0.0
-BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-stock-picker-no-repeat")
+BOT_VERSION = os.getenv("BOT_VERSION", "2026.11.28-import-movements-xlsx")
 
 logging.basicConfig(level=logging.INFO)
 if not BOT_TOKEN:
@@ -869,6 +869,74 @@ def db_add_movement(
     conn.close()
 
 
+def db_import_movements_rows(
+    workspace_id: int,
+    rows: list[dict],
+    actor_name: str,
+    actor_tg_id: int,
+) -> dict:
+    conn = get_conn()
+    cur = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today_str = datetime.now().strftime("%d.%m.%Y")
+
+    added_catalog = 0
+    prihod_count = 0
+    rashod_count = 0
+
+    for r in rows:
+        name = r["name"]
+        op_type = r["op_type"]
+        qty = float(r["quantity"])
+        op_date = r["op_date"] or today_str
+        comment = r["comment"] if r["comment"] is not None else "Загрузка операций из файла"
+        req_cat = r["category"] or "Основное"
+        req_unit = r["unit"] or "шт"
+
+        cat_row = cur.execute(
+            "SELECT id, name, unit, category FROM catalog_items WHERE workspace_id = ? AND lower(trim(name)) = lower(trim(?))",
+            (workspace_id, name),
+        ).fetchone()
+
+        if not cat_row:
+            cur.execute(
+                "INSERT INTO catalog_items (workspace_id, name, unit, category) VALUES (?, ?, ?, ?)",
+                (workspace_id, name, req_unit, req_cat),
+            )
+            added_catalog += 1
+            canon_name = name
+            canon_unit = req_unit
+            canon_cat = req_cat
+        else:
+            canon_name = cat_row["name"]
+            canon_unit = r["unit"] or cat_row["unit"] or "шт"
+            canon_cat = r["category"] or cat_row["category"] or "Основное"
+
+        cur.execute(
+            """
+            INSERT INTO movements (
+                workspace_id, op_date, op_type, item_name, quantity,
+                unit, category, comment, actor_name, actor_tg_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (workspace_id, op_date, op_type, canon_name, qty, canon_unit, canon_cat, comment, actor_name, actor_tg_id, now_str),
+        )
+        if op_type == "Приход":
+            prihod_count += 1
+        else:
+            rashod_count += 1
+
+    conn.commit()
+    conn.close()
+    return {
+        "total": len(rows),
+        "added_catalog": added_catalog,
+        "prihod_count": prihod_count,
+        "rashod_count": rashod_count,
+    }
+
+
 def db_import_stock_rows(
     workspace_id: int,
     rows: list[dict],
@@ -1147,12 +1215,33 @@ def parse_number(raw: str) -> Optional[float]:
         return None
 
 
-def parse_uploaded_stock_file(file_bytes: bytes, filename: str) -> tuple[list[dict], list[str]]:
-    errors: list[str] = []
-    parsed_rows: list[dict] = []
-    lower_name = (filename or "").lower()
+def parse_op_type(raw: str) -> Optional[str]:
+    val = (raw or "").strip().lower()
+    if val in ("приход", "+", "in", "поступление", "приход товара"):
+        return "Приход"
+    if val in ("расход", "-", "out", "списание", "расход товара"):
+        return "Расход"
+    return None
 
+
+def parse_op_date(raw: str) -> Optional[str]:
+    s = (raw or "").strip()
+    if not s:
+        return datetime.now().strftime("%d.%m.%Y")
+    if isinstance(raw, datetime):
+        return raw.strftime("%d.%m.%Y")
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def read_tabular_file(file_bytes: bytes, filename: str) -> tuple[list[list[str]], list[str]]:
+    lower_name = (filename or "").lower()
     raw_table: list[list[str]] = []
+
     if lower_name.endswith(".xlsx"):
         if not HAS_OPENPYXL:
             return [], ["На сервере не установлен openpyxl для чтения .xlsx"]
@@ -1161,7 +1250,10 @@ def parse_uploaded_stock_file(file_bytes: bytes, filename: str) -> tuple[list[di
         for row in sheet.iter_rows(values_only=True):
             if not row:
                 continue
-            vals = ["" if v is None else str(v).strip() for v in row]
+            vals = [
+                v.strftime("%d.%m.%Y") if isinstance(v, datetime) else ("" if v is None else str(v).strip())
+                for v in row
+            ]
             if any(vals):
                 raw_table.append(vals)
     else:
@@ -1182,6 +1274,121 @@ def parse_uploaded_stock_file(file_bytes: bytes, filename: str) -> tuple[list[di
 
     if not raw_table:
         return [], ["Файл пуст"]
+    return raw_table, []
+
+
+def parse_uploaded_movements_file(file_bytes: bytes, filename: str) -> tuple[list[dict], list[str]]:
+    raw_table, io_errors = read_tabular_file(file_bytes, filename)
+    if io_errors:
+        return [], io_errors
+
+    # Поддерживаемые заголовки: Дата | Тип | Наименование | Количество | Категория | Ед. измерения | Комментарий
+    col_map: dict[str, int] = {
+        "op_date": 0,
+        "op_type": 1,
+        "name": 2,
+        "quantity": 3,
+        "category": 4,
+        "unit": 5,
+        "comment": 6,
+    }
+    start_idx = 0
+    first_lower = [c.lower() for c in raw_table[0]]
+    header_hits = 0
+    used_keys: set[str] = set()
+
+    for idx, h in enumerate(first_lower):
+        matched_key = None
+        if any(k in h for k in ("дат", "date")):
+            matched_key = "op_date"
+        elif any(k in h for k in ("тип", "операц", "приход", "расход", "type")):
+            matched_key = "op_type"
+        elif any(k in h for k in ("наимен", "назван", "позиц", "товар", "номенкл", "item")):
+            matched_key = "name"
+        elif any(k in h for k in ("количест", "кол-во", "колво", "qty", "остат", "сумма")):
+            matched_key = "quantity"
+        elif any(k in h for k in ("категор", "групп", "category")):
+            matched_key = "category"
+        elif any(k in h for k in ("ед.", "един", "unit", "измер")):
+            matched_key = "unit"
+        elif any(k in h for k in ("коммент", "примеч", "описан", "накладн", "comment")):
+            matched_key = "comment"
+
+        if matched_key and matched_key not in used_keys:
+            col_map[matched_key] = idx
+            used_keys.add(matched_key)
+            header_hits += 1
+
+    if header_hits >= 2:
+        start_idx = 1
+
+    parsed_rows: list[dict] = []
+    errors: list[str] = []
+
+    for line_num, row in enumerate(raw_table[start_idx:], start=start_idx + 1):
+        first_val_low = row[0].lower() if row else ""
+        if first_val_low in ("склад", "дата выгрузки", "итого", "всего"):
+            continue
+
+        def get_col(key: str, default: str = "") -> str:
+            i = col_map.get(key, -1)
+            return row[i].strip() if 0 <= i < len(row) else default
+
+        name = " ".join(get_col("name").split())
+        if not name:
+            continue
+
+        raw_type = get_col("op_type")
+        op_type = parse_op_type(raw_type)
+        if not op_type:
+            errors.append(
+                f"Строка {line_num} («{esc(name)}»): укажите тип «Приход» или «Расход» (получено «{esc(raw_type)}»)"
+            )
+            continue
+
+        qty_raw = get_col("quantity")
+        qty = parse_number(qty_raw)
+        if qty is None or qty <= 0:
+            errors.append(
+                f"Строка {line_num} («{esc(name)}»): некорректное количество «{esc(qty_raw)}»"
+            )
+            continue
+
+        raw_date = get_col("op_date")
+        op_date = parse_op_date(raw_date)
+        if not op_date:
+            errors.append(
+                f"Строка {line_num} («{esc(name)}»): некорректная дата «{esc(raw_date)}» (нужен формат ДД.ММ.ГГГГ)"
+            )
+            continue
+
+        category = " ".join(get_col("category", "").split())
+        unit = get_col("unit", "").strip()
+        comment_raw = get_col("comment", "").strip()
+        comment = comment_raw if comment_raw else "Загрузка операций из файла"
+
+        parsed_rows.append(
+            {
+                "op_date": op_date,
+                "op_type": op_type,
+                "name": name,
+                "quantity": qty,
+                "category": category,
+                "unit": unit,
+                "comment": comment,
+            }
+        )
+
+    return parsed_rows, errors
+
+
+def parse_uploaded_stock_file(file_bytes: bytes, filename: str) -> tuple[list[dict], list[str]]:
+    raw_table, io_errors = read_tabular_file(file_bytes, filename)
+    if io_errors:
+        return [], io_errors
+
+    errors: list[str] = []
+    parsed_rows: list[dict] = []
 
     col_map = {"category": 0, "name": 1, "qty": 2, "unit": 3}
     start_idx = 0
@@ -1320,6 +1527,10 @@ class ImportStockStates(StatesGroup):
     waiting_file = State()
 
 
+class ImportMovementsStates(StatesGroup):
+    waiting_file = State()
+
+
 class AddCatalogStates(StatesGroup):
     entering_name = State()
     entering_unit = State()
@@ -1363,6 +1574,7 @@ def get_menu_list_keyboard(has_workspace: bool, is_admin: bool) -> ReplyKeyboard
     rows: list[list[KeyboardButton]] = []
     if has_workspace:
         rows.append([KeyboardButton(text="📜 Последние операции"), KeyboardButton(text="🗑 Отменить операцию")])
+        rows.append([KeyboardButton(text="📥 Загрузить приход/расход из Excel")])
         rows.append([KeyboardButton(text="📤 Загрузить остатки из Excel")])
         rows.append([KeyboardButton(text="📥 Остатки в Excel")])
         rows.append([KeyboardButton(text="✏️ Редактировать позицию")])
@@ -2153,7 +2365,85 @@ async def admin_switch_workspace(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# --- ЗАГРУЗКА ОСТАТКОВ ИЗ EXCEL ---
+# --- ЗАГРУЗКА ПРИХОДА/РАСХОДА И ОСТАТКОВ ИЗ EXCEL ---
+@dp.message(F.text == "📥 Загрузить приход/расход из Excel")
+async def start_import_movements_file(message: types.Message, state: FSMContext):
+    ws = await ensure_workspace(message)
+    if not ws:
+        return
+    await state.clear()
+    await state.update_data(workspace_id=ws["id"], workspace_title=ws["title"])
+    await state.set_state(ImportMovementsStates.waiting_file)
+    await message.answer(
+        f"📥 <b>Загрузка прихода и расхода на склад «{esc(ws['title'])}»</b>\n\n"
+        f"Отправьте файл <code>.xlsx</code> (или <code>.csv</code>) с операциями.\n"
+        f"Колонки по заголовкам: <b>Дата | Тип | Наименование | Количество | Категория | Ед. измерения | Комментарий</b> "
+        f"(либо в этом порядке без шапки).\n"
+        f"• <b>Тип</b>: <code>Приход</code> или <code>Расход</code>.\n"
+        f"• <b>Дата</b>: <code>ДД.ММ.ГГГГ</code> (если пусто — поставится сегодня).\n"
+        f"• Если позиции ещё нет в справочнике, она добавится автоматически.",
+        reply_markup=get_cancel_keyboard(),
+    )
+
+
+@dp.message(ImportMovementsStates.waiting_file, F.document)
+async def process_import_movements_file(message: types.Message, state: FSMContext):
+    doc = message.document
+    fname = doc.file_name or "movements.xlsx"
+    if not (fname.lower().endswith(".xlsx") or fname.lower().endswith(".csv")):
+        await message.answer(
+            "Пожалуйста, отправьте файл в формате <code>.xlsx</code> или <code>.csv</code> либо нажмите «❌ Отмена».",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    data = await state.get_data()
+    ws_id = int(data["workspace_id"])
+    ws_title = data["workspace_title"]
+    user = message.from_user
+    actor_name = user.full_name or (f"@{user.username}" if user.username else "Пользователь")
+
+    buf = io.BytesIO()
+    await bot.download(doc, destination=buf)
+    parsed_rows, parse_errors = parse_uploaded_movements_file(buf.getvalue(), fname)
+
+    if not parsed_rows:
+        err_txt = "\n".join(f"• {e}" for e in parse_errors[:10])
+        await message.answer(
+            f"❌ Не удалось загрузить операции из файла.\n{err_txt if err_txt else 'Проверьте колонки и значения.'}",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    stats = db_import_movements_rows(ws_id, parsed_rows, actor_name, user.id)
+    await state.clear()
+
+    lines = [
+        f"✅ <b>Загрузка операций на склад «{esc(ws_title)}» завершена!</b>",
+        f"• Добавлено операций: <b>{stats['total']}</b> (приходов: <b>{stats['prihod_count']}</b>, расходов: <b>{stats['rashod_count']}</b>)",
+    ]
+    if stats["added_catalog"]:
+        lines.append(f"• Новых позиций добавлено в справочник: <b>{stats['added_catalog']}</b>")
+    if parse_errors:
+        lines.append(f"\n⚠️ Пропущено строк с ошибками: {len(parse_errors)}")
+        for e in parse_errors[:5]:
+            lines.append(f"• {e}")
+
+    await send_with_fresh_keyboard(
+        message,
+        "\n".join(lines),
+        has_workspace=True,
+    )
+
+
+@dp.message(ImportMovementsStates.waiting_file)
+async def waiting_import_movements_file_fallback(message: types.Message):
+    await message.answer(
+        "Прикрепите файл <code>.xlsx</code> или <code>.csv</code> как документ либо нажмите «❌ Отмена».",
+        reply_markup=get_cancel_keyboard(),
+    )
+
+
 @dp.message(F.text == "📤 Загрузить остатки из Excel")
 async def start_import_stock_file(message: types.Message, state: FSMContext):
     ws = await ensure_workspace(message)
